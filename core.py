@@ -4,8 +4,6 @@ import os
 import time
 import math
 
-# A Cellular Automata Dynamic Fast Flood Model
-
 
 def QuadEQ(a, b, c, sign):
     discriminant = b**2 - 4*a*c
@@ -37,6 +35,8 @@ def QuadEQ(a, b, c, sign):
 def Delta(a):
     return 1 if a > 0 else 0
 
+# A Cellular Automata Dynamic Fast Flood Model
+
 
 class CADFFM:
     def __init__(self, dem_file):
@@ -65,6 +65,8 @@ class CADFFM:
         self.min_WD = 0.01
         # it is epsilon in the paper
         self.min_Head = 0.01
+        # how fast approach the calculated timestep from adaptive reduced timestep
+        self.delta_t_bias = 0
 
     def SetSimulationTime(self, t, delta_t):
         self.t = t
@@ -160,9 +162,10 @@ class CADFFM:
     def RunSimulation(self):
         current_time = 0
 
+        delta_t = min(self.delta_t, self.CFL_deltat(
+            self.d, self.u, self.v))
+
         while current_time < self.t:
-            delta_t = min(self.delta_t, self.CFL_deltat(
-                self.d, self.u, self.v))
 
             H = self.ComputeBernoulliHead(self.z, self.d, self.u, self.v)
             FD = np.zeros_like(self.z, dtype=np.int)
@@ -225,9 +228,11 @@ class CADFFM:
             d_new = self.d + delta_d * delta_t
             min_index = np.argmin(d_new)
             if d_new[min_index] < 0:
-                delta_t = (self.min_WD -
-                           self.d[min_index]) / delta_d[min_index]
-                d_new = self.d + delta_d * delta_t
+                delta_t_new = (self.min_WD -
+                               self.d[min_index]) / delta_d[min_index]
+                d_new = self.d + delta_d * delta_t_new
+            else:
+                delta_t_new = delta_t
 
             # this loop calculate velocities in both directions
             for i in range(1, self.dem_shape[0] - 1):
@@ -263,4 +268,10 @@ class CADFFM:
 
             self.d = d_new
 
-            current_time += delta_t
+            current_time += delta_t_new
+
+            delta_t = min(self.delta_t, self.CFL_deltat(
+                self.d, self.u, self.v))
+            if delta_t_new < delta_t:
+                delta_t = (delta_t_new + (self.delta_t_bias + 1)
+                           * delta_t) / (self.delta_t_bias + 2)
