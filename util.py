@@ -33,8 +33,9 @@ def DEMRead(dem_file):
     msk = src.read_masks(band)
     DEM = DEM.astype(np.double)
     bounds = np.zeros(4)
-    bounds = [src.bounds.left, src.bounds.top, src.bounds.right, src.bounds.bottom]
- 
+    bounds = [src.bounds.left, src.bounds.top,
+              src.bounds.right, src.bounds.bottom]
+
     mask = np.zeros_like(DEM, dtype=bool)
     mask[msk == 0] = True
     mask[0, :] = True
@@ -62,7 +63,7 @@ def DEMGenerate(npa, dst_filename, mask=None):
 
     if mask is not None:
         npa = np.ma.masked_array(npa, mask)
-        
+
     with rio.open(dst_filename, 'w', **profile) as dst:
         dst.write(npa, 1)
 
