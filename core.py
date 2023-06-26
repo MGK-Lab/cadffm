@@ -3,6 +3,8 @@ import util as ut
 import os
 import time
 import math
+import sys
+import copy
 
 
 def QuadEQ(a, b, c, sign):
@@ -41,6 +43,7 @@ def Delta(a):
 class CADFFM:
     def __init__(self, dem_file):
         print("\n .....loading DEM file using CA-ffé.....")
+        self.begining = time.time()
         print("\n", time.ctime(), "\n")
 
         self.dem_file = dem_file
@@ -49,7 +52,6 @@ class CADFFM:
         self.cell_length = 1
 
         self.d = np.zeros_like(self.z, dtype=np.double)
-        self.d_new = np.zeros_like(self.z, dtype=np.double)
         self.u = np.zeros_like(self.z, dtype=np.double)
         self.v = np.zeros_like(self.z, dtype=np.double)
         self.n0 = np.zeros_like(self.z, dtype=np.double)
@@ -58,59 +60,70 @@ class CADFFM:
 
         self.t = 0
         self.delta_t = 0
+        # how fast approach the calculated timestep from adaptive reduced timestep
+        self.delta_t_bias = 0
+
         self.g = 9.81
-        self.CFL = 0.2
+        self.CFL = 0.5
 
         # it is the delta in the paper
         self.min_WD = 0.01
         # it is epsilon in the paper
         self.min_Head = 0.01
-        # how fast approach the calculated timestep from adaptive reduced timestep
-        self.delta_t_bias = 0
 
-    def SetSimulationTime(self, t, delta_t):
+    def SetSimulationTime(self, t, delta_t, delta_t_bias=0):
         self.t = t
         self.delta_t = delta_t
+        self.delta_t_bias = delta_t_bias
 
+    # calculate max timestep based on Courant–Friedrichs–Lewy condition
     def CFL_deltat(self, d, u, v):
         return self.CFL * np.min(self.cell_length/(np.sqrt(u**2 + v**2) + np.sqrt(self.g*d)))
 
+    # Calculate the Bernoulli head
     def ComputeBernoulliHead(self, z, d, u, v):
-        # Calculate the Bernoulli head
         return z + d + (u**2 + v**2)/(2*self.g)
 
+    # Check if (H0-Hi)>=epsilon for Normal Flow Condition
     def ComputeFlowDirectionH(self, H):
-        # Check if (H0-Hi)>=epsilon for Normal Flow Condition
         tmp = H[0]-H[1:5]
-        for i in tmp:
-            if i >= self.min_Head:
-                i = 1
+        for i in range(0, 4):
+            if tmp[i] >= self.min_Head:
+                tmp[i] = 1
             else:
-                i = 0
+                tmp[i] = 0
         return tmp.astype(np.int)
 
+    # Check if (Q*theta)>=0 for Normal Flow Condition
     def ComputeFlowDirectionQ(self, d, u, v):
-        # Check if (Q*theta)>=0 for Normal Flow Condition
         Q_i = np.array([(u[0]*d[0]-u[1]*d[1]), (v[0]*d[0]-v[2]*d[2]),
                         (u[0]*d[0]-u[3]*d[3]), (v[0]*d[0]-v[4]*d[4])])
         Q_i = Q_i * self.theta
-        for i in Q_i:
-            if i >= 0:
-                i = 1
+        Q_i_unchanged = copy.deepcopy(Q_i)
+        for i in range(0, 4):
+            if Q_i[i] >= 0:
+                Q_i[i] = 1
             else:
-                i = 0
-        return Q_i.astype(np.int)
+                Q_i[i] = 0
+        return Q_i.astype(np.int), Q_i_unchanged
 
     def ComputeMassFlux(self, n0, H, d, z):
         d_bar_i = (d[0] + d[1:5]) / 2
+        Hloc = H[0]-H[1:5]
+        # to avoid negative value for sqrt
+        Hloc[Hloc < 0] = 0
 
         Q_mannings = (self.cell_length / n0) * d_bar_i**(5/3) * \
-            np.sqrt((H[0]-H) / self.cell_length)
+            np.sqrt((Hloc) / self.cell_length)
 
         z_bar_i = np.maximum(z[0], z[1:5])
         h0_i = H[0] - z_bar_i
         h_i = np.maximum(0, H[1:5] - z_bar_i)
-        psi_i = (1 - (h_i / h0_i)**1.5)**0.385
+        psi_i = 1 - (h_i / h0_i)**1.5
+        # to avoid negative value for the power of 0.385
+        psi_i[psi_i < 0] = 0
+        psi_i[psi_i > 1] = 1
+        psi_i = psi_i**0.385
 
         Q_weirs = (2/3) * self.cell_length * \
             np.sqrt(2*self.g) * psi_i * h0_i**1.5
@@ -120,7 +133,7 @@ class CADFFM:
     def ComputeMassFluxSpecial(self, con, H, d, Q, deltat):
         Qs = np.zeros(4)
         for i in range(1, 5):
-            if con[i] > 0:
+            if con[i-1] > 0:
                 dQ_1 = self.cell_length**2 / \
                     (2 * deltat) * (H[i] - H[0] + self.min_Head)
                 dQ_2 = self.cell_length**2 / deltat * \
@@ -129,7 +142,7 @@ class CADFFM:
 
                 tmp = np.abs(Q[i-1])-dQ
                 if tmp > 0:
-                    Qs[i-1] = np.sgn(Q[i-1])*tmp
+                    Qs[i-1] = math.copysign(tmp, Q[i-1])
                 else:
                     Qs[i-1] = 0
 
@@ -161,6 +174,9 @@ class CADFFM:
 
     def RunSimulation(self):
         current_time = 0
+
+        if self.t * self.delta_t == 0:
+            sys.exit("Simulation time or timestep have not been defined")
 
         delta_t = min(self.delta_t, self.CFL_deltat(
             self.d, self.u, self.v))
@@ -196,7 +212,7 @@ class CADFFM:
 
                         # calculate fluxes and directions
                         FDH = self.ComputeFlowDirectionH(Hloc)
-                        FDQ = self.ComputeFlowDirectionQ(d, u, v)
+                        FDQ, Q_vel = self.ComputeFlowDirectionQ(d, u, v)
                         Q = self.ComputeMassFlux(self.n0[i, j], Hloc, d, z)
 
                         # the normal flow condition is valid
@@ -206,9 +222,9 @@ class CADFFM:
                         # the special flow condition is valid
                         SFD = d[1:]
                         SFD[SFD > 0] = 1
-                        SFD *= FDH ^ 1 * FDQ
+                        SFD *= (FDH ^ 1) * FDQ
                         Qs = self.ComputeMassFluxSpecial(
-                            self, SFD, Hloc, d, Q, delta_t)
+                            self, SFD, Hloc, d, Q_vel, delta_t)
 
                         # final flow flux values considering both conditions
                         Qn[SFD == 1] = 0
@@ -218,7 +234,7 @@ class CADFFM:
                         FDloc = Q
                         FDloc[FDloc != 0] = 1
                         FD[i, j] = int(
-                            ''.join(map(str, FDloc.astype(np.int))), 2)
+                            ''.join(map(str, FDloc.astype(int))), 2)
 
                         delta_d = 1 / self.cell_length**2 * \
                             np.sum(-self.theta * Q)
@@ -259,6 +275,7 @@ class CADFFM:
                                       self.n0[i, j-1]])
 
                         FDloc = np.binary_repr(FD[i, j], 4)
+                        FDloc = [int(digit) for digit in FDloc]
                         vel = self.ComputeVelocity(
                             FDloc, n, d, z, u, v, H[i, j], self.d[i, j])
                         self.u[i, j] = Delta(-vel[0]) * \
