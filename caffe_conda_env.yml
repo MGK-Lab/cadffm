@@ -1,0 +1,13 @@
+# run conda env create -f caffe_conda_env.yml
+
+name: cadffm
+channels:
+  - defaults
+dependencies:
+  - python=3.9.12
+  - numpy
+  - rasterio
+  - pip
+  - matplotlib
+  - colorama
+  - pandas

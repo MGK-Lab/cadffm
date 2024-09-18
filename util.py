@@ -1,49 +1,87 @@
 from __future__ import division
 import rasterio as rio
+import rasterio.transform as transform
 from rasterio.profiles import DefaultGTiffProfile
 import numpy as np
+import pandas as pd
+import glob
+import os
+# import h5py
 import warnings
+import util as ut
+
+def ArrayToRaster(arr, filename, sample_raster, mask=None):
+    # Ignore the warning for not having a georeference
+    warnings.filterwarnings(
+        "ignore", category=rio.errors.NotGeoreferencedWarning)
+
+    # Load sample raster metadata
+    with rio.open(sample_raster, 'r') as src:
+        meta = src.meta.copy()
+        if mask is None:
+            mask = src.read_masks(1).astype(bool)
+
+    # Update metadata for output raster
+    meta.update({
+        'count': 1,
+        'dtype': arr.dtype,
+        'height': arr.shape[0],
+        'width': arr.shape[1],
+        'nodata': -9999,  # set nodata value here
+        # 'transform': transform.Affine(1, 0, meta['transform'][2],         #use this to create raster
+        #                               0, 1, meta['transform'][5])
+    })
+
+    # Create output raster file
+    with rio.open(filename, 'w', **meta) as dst:
+        # Mask array and write to raster file
+        arr_masked = np.where(mask, arr, meta['nodata'])
+        dst.write(arr_masked, 1)
 
 
-def arraytoRasterIO(array, existingraster, dst_filename):
-    """this function is used to save a 2D numpy array as a GIS raster map"""
+def VelocitytoRasterIO(velx, vely, existingraster, dst_filename):
     with rio.open(existingraster) as src:
         naip_meta = src.profile
         mask = src.dataset_mask()
 
-    naip_meta['count'] = 1
-    naip_meta['nodata'] = -999
+    naip_meta['count'] = 2
+    naip_meta['nodata'] = 0
+    naip_meta['dtype'] = 'float32'
+    naip_meta['nodata'] = 0
     warnings.filterwarnings(
         "ignore", category=rio.errors.NotGeoreferencedWarning)
 
     # write your the ndvi raster object
     with rio.open(dst_filename, 'w', **naip_meta) as dst:
-        dst.write(np.ma.masked_array(array, mask), 1)
+        dst.write(np.ma.masked_array(velx, mask), 1)
+        dst.write(np.ma.masked_array(vely, mask), 2)
 
 
-def DEMRead(dem_file):
-    """this function is used to read digital elevation model (DEM file) of
-    the 1st layer (band = 1)"""
+def RasterToArray(dem_file):
+    # Ignore the warning for not having a georeference
     warnings.filterwarnings(
         "ignore", category=rio.errors.NotGeoreferencedWarning)
 
-    src = rio.open(dem_file)
-    band = 1
-    DEM = src.read(band)
-    msk = src.read_masks(band)
-    DEM = DEM.astype(np.double)
-    bounds = np.zeros(4)
-    bounds = [src.bounds.left, src.bounds.top,
-              src.bounds.right, src.bounds.bottom]
+    # Open the DEM file
+    with rio.open(dem_file) as src:
+        DEM = src.read(1)
+        mask = src.read_masks(1)
+        bounds = [src.bounds.left, src.bounds.top,
+                  src.bounds.right, src.bounds.bottom]
+        geotransform = src.transform
+        cell_size = geotransform[0]
 
-    mask = np.zeros_like(DEM, dtype=bool)
-    mask[msk == 0] = True
+    DEM = DEM.astype(np.double)
+    bounds = np.array(bounds)
+    mask = ~mask.astype(bool)
+
+    # Create a wall all around the domain
     mask[0, :] = True
     mask[-1, :] = True
     mask[:, 0] = True
     mask[:, -1] = True
 
-    return DEM, mask, bounds
+    return DEM, mask, bounds, cell_size
 
 
 def DEMGenerate(npa, dst_filename, mask=None):
@@ -56,7 +94,7 @@ def DEMGenerate(npa, dst_filename, mask=None):
     profile['dtype'] = 'float32'
     profile['blockxsize'] = 128
     profile['blockysize'] = 128
-    # profile['transform'] = rio.Affine(1, 0, 0, 0, 1, 0)
+    profile['transform'] = transform.Affine(1, 0, 0, 0, 1, -npa.shape[0])
 
     warnings.filterwarnings(
         "ignore", category=rio.errors.NotGeoreferencedWarning)
@@ -78,3 +116,33 @@ def InverseWeightedDistance(x, y, v, grid, power):
                 total = np.sum(1/(distance**power))
                 grid[i, j] = np.sum(v/(distance**power)/total)
     return grid
+
+def merge_csv(directory_path):
+    
+    csv_files = glob.glob(directory_path + "/*.csv")
+    csv_files.sort(key=lambda x: int(x.split("/")[-1].split(".")[0]))
+    dataframes = []
+    for i, file in enumerate(csv_files):
+        df = pd.read_csv(file)
+        dataframes.append(df)
+        if i != len(csv_files) - 1:
+            gap = pd.DataFrame([None] * 1)
+            dataframes.append(gap)
+        
+    merged_df = pd.concat(dataframes, ignore_index=True)
+    merged_df.to_csv('merged_file.csv', index=False)
+
+import numpy as np
+
+# def InverseWeightedDistance(data, grid, power, x_col=0, y_col=1, v_col=2):
+#     for i in range(grid.shape[0]):
+#         for j in range(grid.shape[1]):
+#             distances = np.sqrt((data[:, x_col] - i)**2 + (data[:, y_col] - j)**2)
+#             if (distances**power).min() == 0:
+#                 grid[i, j] = data[(distances**power).argmin(), v_col]
+#             else:
+#                 weights = 1 / (distances**power)
+#                 total = np.sum(weights)
+#                 grid[i, j] = np.sum(data[:, v_col] * weights / total)
+#     return grid
+
