@@ -9,30 +9,27 @@ import pandas as pd
 
 #Quadratic Equation Solver
 def quad_Eq(a, b, c, sign):
-    if (math.isnan(a)+math.isnan(b)+ math.isnan(c))==0:
-        discriminant = b**2 - 4*a*c
-        if discriminant > 0:
-            # two real solutions
-            x1 = (-b + math.sqrt(discriminant)) / (2*a)
-            x2 = (-b - math.sqrt(discriminant)) / (2*a)
-        
-            solution1 = sign*x1 if sign*x1 > 0 else 0
-            solution2 = sign*x2 if sign*x2 > 0 else 0
-            # take the minimum of absolute values of two solutions
-            if (solution1 == 0 and solution2 == 0):
-                solution = 0
-            if (solution1 * solution2 == 0):
-                solution = solution1 if solution1 > 0 else solution2
-                solution *= sign
-            if (solution1 * solution2 > 0):
-                solution = min(solution1, solution2)
-                solution *= sign
-        elif discriminant == 0:
-            # one real solution
-            x = -b / (2*a)
-            solution = x if sign*x > 0 else 0
-        else:
+    discriminant = b**2 - 4*a*c
+    if discriminant > 0:
+        # two real solutions
+        x1 = (-b + math.sqrt(discriminant)) / (2*a)
+        x2 = (-b - math.sqrt(discriminant)) / (2*a)
+    
+        solution1 = sign*x1 if sign*x1 > 0 else 0
+        solution2 = sign*x2 if sign*x2 > 0 else 0
+        # take the minimum of absolute values of two solutions
+        if (solution1 == 0 and solution2 == 0):
             solution = 0
+        if (solution1 * solution2 == 0):
+            solution = solution1 if solution1 > 0 else solution2
+            solution *= sign
+        if (solution1 * solution2 > 0):
+            solution = min(solution1, solution2)
+            solution *= sign
+    elif discriminant == 0:
+        # one real solution
+        x = -b / (2*a)
+        solution = x if sign*x > 0 else 0
     else:
         solution = 0
 
@@ -65,7 +62,6 @@ class CADFFM:
         self.dem_file = dem_file
         self.z, self.ClosedBC, self.bounds, self.cell_length = ut.RasterToArray(dem_file)
         self.dem_shape = self.z.shape
-        self.ClosedBC[:,-1] = False
         self._initialize_arrays()                           # initialize arrays
         self.n0[:] = n                                      # Manning's n
         self.t = 0
@@ -74,13 +70,14 @@ class CADFFM:
         self.delta_t_bias = 0
         self.g = g                                          # acceleration due to gravity
         self.CFL = CFL                                      # Courant–Friedrichs–Lewy condition
-        self.BCtol= 1.0e6                                   # set as a boundary cell elevation
+        self.BCtol= 1e6                                   # set as a boundary cell elevation
         self.min_WD = min_wd                                # minimum water depth to consider the cell as wet
         self.min_Head = min_head                            # minimum head difference to consider the flow direction         
-        self.OpenBC[:,-1] = True                            # open BC at the right edge     
         self.remaining_volume = 0                           # total remaining volume of water
         self.initial_volume = 0                           # total remaining volume of water
         self.cell_length_2 = self.cell_length**2
+        self.sqrt_2_g = 0
+        self.weir_eq_const = 0
         
     # initialize arrays   
     def _initialize_arrays(self):
@@ -102,13 +99,9 @@ class CADFFM:
         name = self.dem_file.split('/')
         name = name[-1].split('.')
         self.outputs_name = name[0] + "_out"
-        self.DEM_path = os.path.join(output_path, 'DEM/')
-        self.csv_merg_path = os.path.join(output_path, 'csv_merged/')
         self.WL_output = os.path.join(output_path, 'WL/')
-        self.outputs_TND = os.path.join(output_path, 'TND/')
         # create a file if the file path is not created for above paths 
-        for path in [self.DEM_path, self.csv_merg_path, 
-                     self.WL_output, self.outputs_TND]:
+        for path in [self.WL_output]:
             if not os.path.exists(path):
                 os.makedirs(path)
         
@@ -137,100 +130,187 @@ class CADFFM:
     def compute_Bernoulli_head(self, z, d, u, v):
         return z + d + (u**2 + v**2)/(2*self.g)
     
-    # Check if (H0-Hi)>=epsilon for Normal Flow Condition
-    def normal_flow_direction_H(self, H):
-        H_diff = H[0]-H[1:5]
-        H_i_dir = np.zeros(4, dtype=np.int64)
-        H_i_dir[H_diff >= self.min_Head] = 1
-
-        return H_i_dir
-    
-    # Check if (Hi-H0)>epsilon for Special Flow Condition
-    def special_flow_direction_H(self, H):
-        H_diff = H[1:5]-H[0]
-        H_i_dir = np.zeros(4, dtype=np.int64)
-        H_i_dir[H_diff >= self.min_Head] = 1
-
-        return H_i_dir
-    
     # Check if (Q*theta)>=0 for Normal Flow Condition
-    def normal_flow_direction_Q(self, u, v):
-        Q_i = np.array([u[0], v[0], u[0], v[0]]) * self.theta
-        Q_i_dir = np.zeros(4, dtype=np.int64)
-        Q_i_dir[Q_i >= 0] = 1
+    def normal_flow_direction(self, u, v, H, d, max_v):
+        H_i_dir = np.zeros(4, dtype=np.int8)
+        H_diff = H[0]-H[1:5]
+        H_i_dir[H_diff > self.min_Head] = 1
+        
+        if max_v >=1:
+            a = 1 / max_v
+        else:
+            a = 0.4 / max_v  
+        
+        Q_i_dir = np.zeros(4, dtype=np.int8)
+        Q_i = np.array([u[0], v[0], u[0], v[0]]) * a * self.theta 
+        Q_i = np.round(Q_i, 1)
+        Q_i_dir[Q_i>=0] = 1
+        
+        Q_i_dir *= H_i_dir
+        
+        Q_i *= self.theta
+        Q_i1 = np.array([u[1]*d[1], v[2]*d[2], u[3]*d[3], v[4]*d[4]])
+        
+        for i in range(4):
+            if Q_i_dir[i] == 1:
+                if Q_i[i] * Q_i1 [i] < 0:
+                    if (Q_i[i] + Q_i1 [i]) * self.theta[i] < 0:
+                        Q_i_dir[i] = 0
+                
+        return Q_i_dir
+
+    # Calculate if (Q*theta)>0 for Special Flow Condition
+    def special_flow_direction(self, u, v, H, d):
+        H_diff = H[1:5]-H[0]
+        H_i_dir = np.zeros(4, dtype=np.int8)
+        H_i_dir[H_diff > self.min_Head] = 1
+
+        
+        Q_i_dir = np.zeros(4, dtype=np.int8)
+        Q_i = np.array([u[0], v[0], u[0], v[0]]) * d[0] * self.theta
+        Q_i_dir[Q_i > 0] = 1
+        
+        Q_i_dir *= H_i_dir
+        
+        Q_i *= self.theta
+        Q_i1 = np.array([u[1]*d[1], v[2]*d[2], u[3]*d[3], v[4]*d[4]])
+        
+        for i in range(4):
+            if Q_i_dir[i] == 1:
+                if Q_i[i] * Q_i1 [i] < 0:
+                    if (Q_i[i] + Q_i1 [i]) * self.theta[i] < 0:
+                        Q_i_dir[i] = 0
 
         return Q_i_dir
     
-    def compute_normal_flow_mass_flux_i(self, n0, H, d, z, i):
+    def Q_Mannings(self, n0, H, d, i):
         # calculate mass flux with Mannings equation
-        d_bar_i = (d[0] + d[i+1]) / 2
+        d_bar_i = d[0]
         Hloc = H[0] - H[i+1]
-        if Hloc < 0:
-            Hloc = 0
-        Q_mannings = (self.cell_length / n0) * d_bar_i**(c5_3) * \
-            np.sqrt(Hloc / self.cell_length)
-              
-        # calculate mass flux with Weir equation
+        if Hloc > 0:
+            Q = (self.cell_length / n0) * d_bar_i**(c5_3) * np.sqrt(Hloc / self.cell_length)
+        else: 
+            Q = 0
+            
+        return Q
+    
+    def Q_Weir_h(self, H, d, z, i):
+        # calculate mass flux with Mannings equation
         z_bar_i = max(z[0], z[i+1])
-
-        # calculate submergance coefficient based on head
         h0_i = H[0] - z_bar_i
         h_i =  H[i+1] - z_bar_i
         psi_i_h = 0
         if h0_i>0:
-            ratio_h = h_i / h0_i
-            if ratio_h>=0 and ratio_h<1:
-                psi_i_h = (1 - ratio_h**1.5)**0.385
+            if h_i <= 0:
+                psi_i_h = 1
+            else:
+                ratio_h = h_i / h0_i
+                if ratio_h < 1:
+                    psi_i_h = (1 - ratio_h**1.5)**0.385
         else:
             h0_i = 0        
 
+        Q = self.weir_eq_const * psi_i_h * h0_i**1.5
+                   
+        return Q
+    
+    def Q_Weir_d(self, H, d, z, i):
+        z_bar_i = max(z[0], z[i+1])
+        h0_i = H[0] - z_bar_i
        # calculate submergance coefficient based on depth
         d0_i = d[0] + z[0] - z_bar_i
         d_i = d[i+1] + z[i+1] - z_bar_i
         psi_i_d = 0
         if d0_i>0:
-            ratio_d = d_i/d0_i
-            if ratio_d>=0 and ratio_d<1:
-                psi_i_d = (1 - ratio_d**1.5)**0.385
-                    
-        Q_weirs_d = c2_3 * self.cell_length * \
-            np.sqrt(2*self.g) * psi_i_d * h0_i**1.5
-        Q_weirs_h = c2_3 * self.cell_length * \
-            np.sqrt(2*self.g) * psi_i_h * h0_i**1.5
-        Q_weirs = max(Q_weirs_d, Q_weirs_h)
+            if d_i <= 0:
+               psi_i_d = 1
+            else: 
+                ratio_d = d_i/d0_i
+                if ratio_d<1:
+                    psi_i_d = (1 - ratio_d**1.5)**0.385
         
-        Q = 0    
-        if z[0] >= z_bar_i:
-            Q = non_zero_min(Q_mannings, Q_weirs)
-        elif z_bar_i<1e5:
-            Q = max(Q_mannings, Q_weirs_h)
+        Q = self.weir_eq_const * psi_i_d * h0_i**1.5
+            
+        return Q
 
-        return Q * self.theta[i]
+    
+    def compute_normal_flow_mass_flux_i(self, n0, H, d, z, u, v, i):
+        Q_mannings = self.Q_Mannings(n0, H, d, i)
+        Q_weir = max(self.Q_Weir_d(H, d, z, i), self.Q_Weir_h(H, d, z, i))
+        Q = non_zero_min(Q_mannings, Q_weir) * self.theta[i] 
+        
+    
+        # # calculate mass flux using the current velocity
+        # if i == 0 or i == 2:
+        #     Q_vel = self.cell_length * d[0] * u[0] * self.theta[i]
+        # else:
+        #     Q_vel = self.cell_length * d[0] * v[0] * self.theta[i]
+        # if Q_vel < 0:
+        #     Q_vel = 0
+
+
+        # if z[0] > z[i+1]:
+        #     Q = non_zero_min(Q_weirs_d, Q_weirs_h) 
+        #     Q = non_zero_min(Q_mannings, Q)
+           
+
+        # if z[0] == z[i+1]:
+        #     Q = (Q + Q_v) / 2
+        # if d[i+1] < self.min_WD:
+        #     Q = (Q_weirs + Q_mannings) / 2        
+
+        Q_vel = self.cell_length * d[0] * v[0]
+
+        if z[0] < z[i+1]:
+            Q = max(Q, Q_vel)
+
+            
+        # if Q_vel * Q < 0:
+        #     Q += Q_vel
+        # if Q_vel * Q <= 0:
+        #     Q = Q_vel + Q
+        
+        # if z[0] == z[i+1]:
+        #     Q_vel = self.cell_length * v[i+1] * d[i+1]
+        #     if (Q + Q_vel) * self.theta[i] < 0:
+        #         Q = 0
+        
+        return  Q
     
     # Calculate mass flux for special flow condition
-    def compute_special_flow_mass_flux_i(self, d, u, v, H, deltat, i):
+    def compute_special_flow_mass_flux_i(self, d, z, u, v, H, n0, deltat, i):
         dQ_1 = self.cell_length_2 / (2 * deltat) * (H[i+1] - H[0] + self.min_Head)
         dQ_2 = self.cell_length_2 / deltat * (d[i+1] - self.min_WD)
         dQ = min(dQ_1, dQ_2)
         
-        if i == 0 or i == 2:
-            Q = self.cell_length * d[0] * u[0]
-                
-        if i == 1 or i == 3:
-            Q = self.cell_length * d[0] * v[0]
-                
-        if Q * self.theta[i] < 0:
-            Q = 0
-                       
+        # Q_mannings = self.Q_Mannings(n0, d+z, d, i)
+        Q_weir = self.Q_Weir_d(d+z, d, z, i)
+        # Q = min(Q_mannings, Q_weir)
+        Q = Q_weir
         
+        if i == 0 or i == 2:
+            Q_vel = self.cell_length * d[0] * u[0] * self.theta[i]
+        else:
+            Q_vel = self.cell_length * d[0] * v[0] * self.theta[i]
+
+        if Q_vel < 0:
+            Q_vel = 0
+        
+
+        # Q = (Q + Q_vel) / 2
+        # Q = Q_vel
+        if Q_vel != 0:
+            Q = Q_vel
+        
+            
         if Q != 0:
             tmp = abs(Q)-dQ
             if tmp > 0:
-                Q = self.theta[i] * tmp
+                Q = tmp
             else:
                 Q = 0
-            
-        return Q 
+  
+        return Q * self.theta[i]
     
     # Compute the velocity in both directions
     def compute_velocity(self, FD, n, d, z, u, v, H0, d0):
@@ -238,16 +318,13 @@ class CADFFM:
         x = 0.5/self.g
         z_diff = z-z[0]
         y = 0.5 * np.sqrt(self.cell_length_2 + z_diff**2)
+        # y = 0.5 * self.cell_length
         for i in range(1, 5, 2):
             if FD[i-1] == 1:
                 a = x 
-                b = y[i] * n[i]**2 * abs(u[i]) / (d[i]**c4_3)
+                b = y[i] * n[i]**2 * abs(u[i]) / d[i]**c4_3
                 c = v[i]**2 * x + d[i] + z[i] + y[i] * \
-                    n[0]**2 * u[0]**2 / (d0**c4_3)  - H0
-                # a = x + y[i] * n[i]**2 / (d[i]**c4_3)
-                # b = 0
-                # c = v[i]**2 * x + d[i] + z[i] + y[i] * \
-                #     n[0]**2 * u[0]**2 / (d0**c4_3)  - H0
+                    n[0]**2 * u[0]**2 / d0**c4_3  - H0
                 vel[i-1] = quad_Eq(a, b, c, self.theta[i-1])
 
         for i in range(2, 5, 2):
@@ -255,11 +332,7 @@ class CADFFM:
                 a = x
                 b = y[i] * n[i]**2 * abs(v[i]) / (d[i]**c4_3)
                 c = u[i]**2 * x + d[i] + z[i] + y[i] * \
-                    n[0]**2 * v[0]**2 / (d0**c4_3)  - H0
-                # a = x + y[i] * n[i]**2 / (d[i]**c4_3)
-                # b = 0
-                # c = u[i]**2 * x + d[i] + z[i] + y[i] * \
-                #     n[0]**2 * v[0]**2 / (d0**c4_3)  - H0
+                    n[0]**2 * v[0]**2 / d0**c4_3  - H0
                 vel[i-1] = quad_Eq(a, b, c, self.theta[i-1])
 
         return vel
@@ -267,6 +340,8 @@ class CADFFM:
     def run_simulation(self):
         # to ensure if user changed it 
         self.cell_length_2 = self.cell_length**2
+        self.sqrt_2_g = np.sqrt(2*self.g)
+        self.weir_eq_const = c2_3 * self.cell_length * self.sqrt_2_g
         
         current_time = 0
         iteration = 1
@@ -279,13 +354,19 @@ class CADFFM:
         t_value = 0.1                                               # assigned to use later for depth extraction of every multiples of 0.1sec
 
         self.initial_volume = np.sum(self.d[:,:-1]) * self.cell_length_2
+        initial_min_head = self.min_Head
         
         while current_time < self.t:
             self.set_BCs()
 
             H = self.compute_Bernoulli_head(self.z, self.d, self.u, self.v)         # calculate Bernoulli head
 
-            FD = np.zeros_like(self.z, dtype=np.int64)
+            Max_V = max(abs(np.max(self.v)), abs(np.min(self.v)))
+            if Max_V == 0 or math.isnan(Max_V):
+                Max_V = 1
+            self.min_Head = Max_V**2 * initial_min_head
+                
+            FD = np.zeros_like(self.z, dtype=np.int8)
             delta_d= np.zeros_like(self.z, dtype=np.double)
             d_new = np.zeros_like(self.z, dtype=np.double)                  # new water depth
             u_new = np.zeros_like(self.u, dtype=np.double)
@@ -317,36 +398,37 @@ class CADFFM:
                                          H[i, j-1]])
 
                         # calculate normal flow
-                        normal_flow = self.normal_flow_direction_H(H_loc) * self.normal_flow_direction_Q(u, v)
-                        # Q = self.compute_normal_flow_mass_flux(self.n0[i, j], H_loc, d, z)
+                        normal_flow = self.normal_flow_direction(u, v, H_loc, d, Max_V)
                         Qn = np.zeros(4)
                         for n in range(4):
                             if normal_flow[n] > 0:
-                                Qn[n] = self.compute_normal_flow_mass_flux_i(self.n0[i, j], H_loc, d, z, n)
-                     
+                                Qn[n] = self.compute_normal_flow_mass_flux_i(self.n0[i, j], H_loc, d, z, u, v, n)
+                                
                         # compute special flow
                         special_flow = copy.deepcopy(d[1:])
                         special_flow[special_flow > self.min_WD] = 1
-                        special_flow *= self.special_flow_direction_H(H_loc) * self.special_flow_direction_Q(u, v)
-                        # Q_special = self.compute_special_flow_mass_flux(d, u, v, H_loc, special_flow, delta_t)
+                        special_flow *= self.special_flow_direction(u, v, H_loc, d)
+
                         Qs = np.zeros(4)
                         for n in range(4):
                             if special_flow[n] > 0:
-                                Qs[n] = self.compute_special_flow_mass_flux_i(d, u, v, H_loc, delta_t, n)
+                                Qs[n] = self.compute_special_flow_mass_flux_i(d, z, u, v, H_loc, self.n0[i, j], delta_t, n)
                   
                         # final flow flux values considering both conditions
-                        Qn[special_flow == 1] = 0
                         Q = Qs + Qn
-                        
+                                                
                         #  save flow directions as a binary value to reterive later
                         FD_loc = np.copy(Q)
                         FD_loc[FD_loc != 0] = 1
                         FD[i, j] = int(
-                            ''.join(map(str, FD_loc.astype(np.int64))), 2)
+                            ''.join(map(str, FD_loc.astype(np.int8))), 2)
                         
+                        FD_loc = np.binary_repr(FD[i, j], 4)
+                        FD_loc = [int(digit) for digit in FD_loc] 
+
                         # update the water depth according to the mass flux
                         delta_d[i,j] += 1 / self.cell_length_2 * \
-                                    np.sum((-self.theta) * Q)             
+                                    np.sum(-self.theta * Q)             
                         if Q[0] != 0:
                             delta_d[i+1, j] += 1 / self.cell_length_2 * \
                                 (self.theta[0] * Q[0])
@@ -370,16 +452,16 @@ class CADFFM:
                 tmp_values = np.array([])
                 for row in indices_array:
                     r,c = row
-                    tmp = (self.min_WD-self.d[r, c])/ delta_d[r, c]
+                    tmp = abs(self.d[r, c] / delta_d[r, c])
                     tmp_values = np.append(tmp_values,tmp)
                     
-                # for better stability, devided by 2 
-                delta_t_new = np.min(tmp_values) / 2
+                # for better stability, devided by 3 
+                delta_t_new = np.min(tmp_values) / 10
                 d_new = self.d + delta_d * delta_t_new
             else:
                 delta_t_new = delta_t
             current_time += delta_t_new
-            
+
             # this loop calculate velocities in both directions
             for i in range(1, self.dem_shape[0]-1):
                 for j in range(1, self.dem_shape[1]-1):
@@ -406,37 +488,33 @@ class CADFFM:
 
                         # retrieve the flow direction from binary value
                         FD_loc = np.binary_repr(FD[i, j], 4)
-                        FD_loc = [int(digit) for digit in FD_loc]            
-
+                        FD_loc = [int(digit) for digit in FD_loc] 
+                        
                         if sum(FD_loc)>0:
                             vel = self.compute_velocity(
                                 FD_loc, n, d_n, z, u, v, H[i, j], self.d[i, j])
                             
-                            dmin = d_n[1:5]
-                            dmin[dmin>=self.min_WD] = 1
-                            dmin[dmin<1] = 0
+                            u_new[i-1, j] += vel[2]
+                            u_new[i+1, j] += vel[0]
+                            v_new[i, j-1] += vel[3]
+                            v_new[i, j+1] += vel[1]
                             
-                            if FD_loc[0]*FD_loc[2]==1:
-                                u_new[i, j] = delta(self.theta[0]*vel[0])*vel[0] + delta(self.theta[2]*vel[2])*vel[2]
-                            else:
-                                u_new[i-1, j] += vel[2] * dmin[2]
-                                u_new[i+1, j] += vel[0] * dmin[0]
-                                
-                            if FD_loc[1]*FD_loc[3]==1:
-                                v_new[i, j] = delta(self.theta[1]*vel[1])*vel[1] + delta(self.theta[3]*vel[3])*vel[3]
-                            else:
-                                v_new[i, j-1] += vel[3] * dmin[3]
-                                v_new[i, j+1] += vel[1] * dmin[1]
-                            
-                        
             for i in range(1, self.dem_shape[0]-1):
                 for j in range(1, self.dem_shape[1]-1):
                     if u_new[i, j] !=0:
                         self.u[i, j] = u_new[i, j]
-                    if v_new[i, j] !=0:    
-                       self.v[i, j] = v_new[i, j]
-                       
-                            
+                    if v_new[i, j] !=0:
+                        self.v[i, j] = v_new[i, j]
+                    if d_new[i, j] <= self.min_WD and (self.v[i, j] != 0 or self.u[i, j] != 0):
+                        self.v[i, j] = 0
+                        self.u[i, j] = 0
+                        
+                    if j==1 and self.v[i, j]<0:
+                        self.v[i, j] = 0
+                    # if j==100 and self.v[i, j]>0:
+                    #     self.v[i, j] = 0
+                        
+                           
             self.d = d_new
                        
             # to print the outputs for time steps/iterations
@@ -455,7 +533,9 @@ class CADFFM:
                 t_value += 0.1
             
             self.reset_BCs()
-
+            # self.export_time_series(current_time, self.z, self.d, self.d + self.z , H, self.v)
+            # if iteration == 10:
+            #     os.abort()
             # to export the water level and velocity at specified times
             if Time: 
                 self.export_time_series(current_time, self.z, self.d, self.d + self.z , H, self.v)
@@ -512,92 +592,3 @@ class CADFFM:
               ", ", "{:.3f}".format(np.max(self.d)))
         print('volume of water (initial, current): ',  "{:.3f}".format(self.initial_volume), ", ", "{:.3f}".format(self.remaining_volume))
         print("\n")
-        
-    # Calculate mass flux for special flow condition (old)
-    def compute_special_flow_mass_flux(self, d, u, v, H, SFD, deltat):
-        dQ = np.zeros(4)
-        dQ_1 = self.cell_length_2 / (2 * deltat) * (H[1:5] - H[0] + self.min_Head)
-        dQ_2 = self.cell_length_2 / deltat * (d[1:5] - self.min_WD)
-        dQ = np.minimum(dQ_1, dQ_2)
-        
-        Q = np.zeros(4)
-        for i in range(4):
-            if SFD[i] > 0:
-                if i == 0 or i == 2:
-                    if u[0]!=0:
-                        Q[i] = self.cell_length * d[0] * u[0]
-                        if Q[i]*self.theta[i]<0:
-                            Q[i] = 0
-                if i == 1 or i == 3:
-                    if v[0]!=0:
-                        Q[i] = self.cell_length * d[0] * v[0]
-                        if Q[i]*self.theta[i]<0:
-                            Q[i] = 0
-                       
-        tmp = np.abs(Q)-dQ
-        for i in range(4):
-            if Q[i] != 0 and tmp[i]>0:
-                Q[i] = self.theta[i] * tmp[i]
-            else:
-                Q[i] = 0
-        return Q
-    
-    # Calculate if (Q*theta)>0 for Special Flow Condition
-    def special_flow_direction_Q(self, u, v):
-        Q_i = np.array([u[0], v[0], u[0], v[0]]) * self.theta
-        Q_i_dir = np.zeros(4, dtype=np.int64)
-        Q_i_dir[Q_i > 0] = 1
-
-        return Q_i_dir
-
-    # Calculate mass flux for normal flow condition (old)
-    def compute_normal_flow_mass_flux(self, n0, H, d, z):
-        H_p = d + z     
-        Q = np.zeros(4)
-
-        # calculate mass flux with Mannings equation
-        d_bar_i = (d[0] + d[1:5]) / 2
-        Hloc = H[0] - H[1:5]
-        Hloc[Hloc < 0] = 0
-        Q_mannings = (self.cell_length / n0) * d_bar_i**(c5_3) * \
-            np.sqrt(Hloc / self.cell_length)
-              
-        # calculate mass flux with Weir equation
-        z_bar_i = np.maximum(z[0], z[1:5])
-
-        # calculate submergance coefficient based on head
-        h0_i = H[0] - z_bar_i
-        h_i =  H[1:5] - z_bar_i
-        psi_i_h = np.zeros(4)
-        for i in range(4):
-            if h0_i[i]>0:
-                ratio_h = h_i[i] / h0_i[i]
-                if ratio_h>=0 and ratio_h<1:
-                    psi_i_h[i] = (1 - ratio_h**1.5)**0.385
-
-       # calculate submergance coefficient based on depth
-        d0_i = H_p[0] - z_bar_i
-        d_i = H_p[1:5] - z_bar_i
-        psi_i_d = np.zeros(4)
-        for i in range(4):
-            if d0_i[i]>0:
-                ratio_d = d_i[i]/d0_i[i]
-                if ratio_d>=0 and ratio_d<1:
-                    psi_i_d[i] = (1 - ratio_d**1.5)**0.385
-                    
-        h0_i[h0_i<0] = 0
-        Q_weirs_d = c2_3 * self.cell_length * \
-            np.sqrt(2*self.g) * psi_i_d * h0_i**1.5
-        Q_weirs_h = c2_3 * self.cell_length * \
-            np.sqrt(2*self.g) * psi_i_h * h0_i**1.5
-        Q_weirs = np.maximum(Q_weirs_d, Q_weirs_h)
-            
-        for i in range(4):
-            if z[0] >= z_bar_i[i]:
-                Q[i] = non_zero_min(Q_mannings[i], Q_weirs[i])
-            elif z_bar_i[i]<1e5:
-                Q[i] = np.maximum(Q_mannings[i], Q_weirs_h[i])
-
-        return Q * self.theta
-
-        
